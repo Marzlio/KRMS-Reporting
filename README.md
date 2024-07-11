@@ -25,7 +25,7 @@ This project filters device data from the KRMS API, enriches it with geolocation
 1. Clone the repository:
 
     ```sh
-    git clone https://github.com/Marzlio/KRMS.git
+    git clone https://github.com/Marzlio/KRMS-Reporting.git
     cd KRMS
     ```
 
@@ -45,15 +45,20 @@ This project filters device data from the KRMS API, enriches it with geolocation
 4. Create a `.env` file in the project root with the following content:
 
     ```env
+    # KRMS login Details
     API_USERNAME=your_api_username
     PASSWORD=your_api_password
     CLIENT_KEY=your_client_key
+    # KRMS API settings
     PAGE=1
     LIMIT=500000
     ORDERS=[]
+    # IP Info API - https://ipinfo.io/
     IPINFO_TOKEN=your_ipinfo_token
+    # Export file names
     XLSX_OUTPUT_FILE=KRMS_Devices.xlsx
     CSV_OUTPUT_FILE=KRMS_Devices.csv
+    # SMTP Settings
     SMTP_SERVER=smtp.office365.com
     SMTP_PORT=587
     TTLS=TRUE
