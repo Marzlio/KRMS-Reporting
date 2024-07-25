@@ -135,12 +135,20 @@ def generate_report(stats: Dict[str, Any], retailers: Dict[str, Dict[str, int]])
                 p {{
                     margin: 0 0 10px;
                 }}
-                ul {{
-                    list-style-type: none;
-                    padding: 0;
+                table {{
+                    width: 100%;
+                    border-collapse: collapse;
                 }}
-                ul li {{
-                    margin: 5px 0;
+                th, td {{
+                    border: 1px solid #ddd;
+                    padding: 8px;
+                }}
+                th {{
+                    padding-top: 12px;
+                    padding-bottom: 12px;
+                    text-align: left;
+                    background-color: #004080;
+                    color: white;
                 }}
                 .section {{
                     margin-bottom: 20px;
@@ -167,13 +175,30 @@ def generate_report(stats: Dict[str, Any], retailers: Dict[str, Dict[str, int]])
             </div>
             <div class="section">
                 <p class="section-title">Devices per retailer:</p>
-                <ul>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Retailer</th>
+                            <th>CAS Activated</th>
+                            <th>Total Devices</th>
+                            <th>Online in South Africa</th>
+                        </tr>
+                    </thead>
+                    <tbody>
     """
     for retailer, counts in retailers.items():
-        report_content += f"<li>{retailer}: {counts['activated']} activated of {counts['total']}, {counts['in_sa']} are in South Africa</li>"
+        report_content += f"""
+                        <tr>
+                            <td>{retailer}</td>
+                            <td>{counts['activated']}</td>
+                            <td>{counts['total']}</td>
+                            <td>{counts['in_sa']}</td>
+                        </tr>
+        """
     
     report_content += """
-                </ul>
+                    </tbody>
+                </table>
             </div>
         </body>
     </html>
