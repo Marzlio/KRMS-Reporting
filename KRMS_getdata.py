@@ -181,7 +181,10 @@ def generate_report(stats: Dict[str, Any], retailers: Dict[str, Dict[str, int]])
                             <th>Retailer</th>
                             <th>Total Devices</th>
                             <th>CAS Activated</th>
+                            <th>Cas Activated not in ZA</th>
+                            <th>Cas Activated in ZA</th>
                             <th>Online in ZA</th>
+                            <th>Online Not In ZA</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -192,7 +195,11 @@ def generate_report(stats: Dict[str, Any], retailers: Dict[str, Dict[str, int]])
                             <td>{retailer}</td>
                             <td>{counts['total']}</td>
                             <td>{counts['activated']}</td>
+                            <td>{counts['cas_not_in_sa']}</td>
+                            <td>{counts['cas_in_sa']}</td>
                             <td>{counts['in_sa']}</td>
+                            <td>{counts['online_not_in_sa']}</td>
+
                         </tr>
         """
     
@@ -385,11 +392,21 @@ def main() -> None:
                     retailers[retailer]['activated'] += 1
                 if device.get('country') == 'ZA':
                     retailers[retailer]['in_sa'] += 1
+                if (isinstance(activation_status, bool) and activation_status) or (isinstance(activation_status, str) and activation_status.lower() == 'activated') and device.get('country') != 'ZA':
+                    retailers[retailer]['cas_not_in_sa'] += 1
+                if (isinstance(activation_status, bool) and activation_status) or (isinstance(activation_status, str) and activation_status.lower() == 'activated') and device.get('country') == 'ZA':
+                    retailers[retailer]['cas_in_sa'] += 1
+                if (device.get('country') != 'ZA' and device.get('country') != '') and (device.get('connectedTime') != 0):
+                        retailers[retailer]['online_not_in_sa'] += 1
+
             else:
                 retailers[retailer] = {
                     'total': 1,
                     'activated': 1 if (isinstance(activation_status, bool) and activation_status) or (isinstance(activation_status, str) and activation_status.lower() == 'activated') else 0,
-                    'in_sa': 1 if device.get('country') == 'ZA' else 0
+                    'in_sa': 1 if device.get('country') == 'ZA' else 0,
+                    'cas_not_in_sa': 1 if (isinstance(activation_status, bool) and activation_status) or (isinstance(activation_status, str) and activation_status.lower() == 'activated') and device.get('country') != 'ZA' else 0,
+                    'cas_in_sa': 1 if (isinstance(activation_status, bool) and activation_status) or (isinstance(activation_status, str) and activation_status.lower() == 'activated') and device.get('country') == 'ZA' else 0,
+                    'online_not_in_sa': 1 if (isinstance(device.get('online'), bool) and device['online']) or (isinstance(device.get('online'), str) and device['online'].lower() == 'true') and device.get('country') != 'ZA' and device.get('country') != '' else 0
                 }
 
             writer.writerow(device)
