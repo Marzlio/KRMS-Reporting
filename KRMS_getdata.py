@@ -179,9 +179,9 @@ def generate_report(stats: Dict[str, Any], retailers: Dict[str, Dict[str, int]])
                     <thead>
                         <tr>
                             <th>Retailer</th>
-                            <th>CAS Activated</th>
                             <th>Total Devices</th>
-                            <th>Online in South Africa</th>
+                            <th>CAS Activated</th>
+                            <th>Online in ZA</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -190,8 +190,8 @@ def generate_report(stats: Dict[str, Any], retailers: Dict[str, Dict[str, int]])
         report_content += f"""
                         <tr>
                             <td>{retailer}</td>
-                            <td>{counts['activated']}</td>
                             <td>{counts['total']}</td>
+                            <td>{counts['activated']}</td>
                             <td>{counts['in_sa']}</td>
                         </tr>
         """
