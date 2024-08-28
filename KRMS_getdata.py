@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import requests
 import csv
 import pandas as pd
@@ -42,7 +41,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger()
 
 # File for the final report
-report_file = 'krms_devices_report.txt'
+REPORT_FILE = 'krms_devices_report.html'
 
 class IPFetchError(Exception):
     """Custom exception for IP fetch failures."""
@@ -62,7 +61,7 @@ def request_token() -> str:
     }
     try:
         response = requests.post(token_url, headers=headers, json=data)
-        response.raise_for_status()  # Raise an exception for HTTP errors
+        response.raise_for_status()
         token_response = response.json()
         if token_response.get("code") == "success":
             logging.info("Token received successfully.")
@@ -117,7 +116,7 @@ def fetch_ip_info(ip_address: str, ip_info_cache: Dict[str, Any]) -> Dict[str, A
         save_ip_info(ip_info_cache)
         return ip_info_cache[ip_address]
     except requests.RequestException as e:
-        raise IPFetchError(f"Failed to fetch data for {ip_address}: {e}")  # Raise custom exception
+        raise IPFetchError(f"Failed to fetch data for {ip_address}: {e}")
 
 def generate_report(stats: Dict[str, Any], retailers: Dict[str, Dict[str, int]]) -> str:
     """Generate a report with the collected statistics and return the report as a string."""
@@ -211,10 +210,12 @@ def generate_report(stats: Dict[str, Any], retailers: Dict[str, Dict[str, int]])
     </html>
     """
     
-    with open(report_file, 'w') as report:
+    with open(REPORT_FILE, 'w') as report:
         report.write(report_content)
 
     return report_content
+
+ATTACH_FILE = os.getenv('ATTACH_FILE', 'TRUE').upper() == 'TRUE'
 
 def send_email(report_content: str, attachment_path: str) -> None:
     """Send an email with the report and attachment."""
@@ -226,14 +227,15 @@ def send_email(report_content: str, attachment_path: str) -> None:
     # Attach the body with the msg instance
     msg.attach(MIMEText(report_content, 'html'))
 
-    # Open the file to be sent
-    with open(attachment_path, "rb") as attachment:
-        part = MIMEBase('application', 'octet-stream')
-        part.set_payload(attachment.read())
+    if ATTACH_FILE:
+        # Open the file to be sent
+        with open(attachment_path, "rb") as attachment:
+            part = MIMEBase('application', 'octet-stream')
+            part.set_payload(attachment.read())
 
-    encoders.encode_base64(part)
-    part.add_header('Content-Disposition', f"attachment; filename= {os.path.basename(attachment_path)}")
-    msg.attach(part)
+        encoders.encode_base64(part)
+        part.add_header('Content-Disposition', f"attachment; filename= {os.path.basename(attachment_path)}")
+        msg.attach(part)
 
     # Send the message via the SMTP server
     try:
@@ -248,60 +250,12 @@ def send_email(report_content: str, attachment_path: str) -> None:
     except Exception as e:
         logging.error(f"Failed to send email: {e}")
 
-def main() -> None:
-    """Main function to execute the script."""
-    logging.info("Script started.")
-    try:
-        token = request_token()
-    except Exception as e:
-        logging.error("Failed to obtain token: %s", e)
-        return
-
-    profile_url = "https://www.krms.openview.co.za/auth/v1/profile"
-    user_url = "https://www.krms.openview.co.za/api/v1/iams/user"
-    devices_url = "https://www.krms.openview.co.za/api/v1/devices/connects/page"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json;charset=utf-8",
-        "User-Agent": "Mozilla/5.0"
-    }
-
-    try:
-        logging.info("Requesting profile data...")
-        profile_data = request_data(profile_url, headers)
-        logging.info("Profile data received.")
-        
-        logging.info("Requesting user data...")
-        user_data = request_data(user_url, headers)
-        logging.info("User data received.")
-        
-        logging.info("Requesting devices data...")
-        devices_data = request_data(devices_url, headers, data={
-            "page": PAGE,
-            "limit": LIMIT,
-            "keyword": {},
-            "orders": ORDERS,
-        })
-        logging.info("Devices data received.")
-    except requests.RequestException as e:
-        logging.error("Error requesting data: %s", e)
-        return
-
-    # Load IP info cache
-    ip_info_cache = load_ip_info()
-    devices = devices_data.get('data', [])
-
-    if not devices:
-        logging.info("No devices data found.")
-        return
-
+def process_devices(devices: list, ip_info_cache: dict) -> tuple:
+    """Process devices and gather statistics."""
     csv_headers = list(devices[0].keys()) if devices else []
     if "country" not in csv_headers:
         csv_headers.append("country")
 
-    updated_devices = []
-
-    # Initialize statistics
     stats = {
         'total_devices': len(devices),
         'cas_activated': 0,
@@ -416,6 +370,57 @@ def main() -> None:
     df.to_excel(XLSX_OUTPUT_FILE, index=False)
 
     stats['devices_not_in_sa'] = stats['cas_activated'] - stats['devices_in_sa']
+
+    return stats, retailers
+
+def main() -> None:
+    """Main function to execute the script."""
+    logging.info("Script started.")
+    try:
+        token = request_token()
+    except Exception as e:
+        logging.error("Failed to obtain token: %s", e)
+        return
+
+    profile_url = "https://www.krms.openview.co.za/auth/v1/profile"
+    user_url = "https://www.krms.openview.co.za/api/v1/iams/user"
+    devices_url = "https://www.krms.openview.co.za/api/v1/devices/connects/page"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json;charset=utf-8",
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    try:
+        logging.info("Requesting profile data...")
+        profile_data = request_data(profile_url, headers)
+        logging.info("Profile data received.")
+        
+        logging.info("Requesting user data...")
+        user_data = request_data(user_url, headers)
+        logging.info("User data received.")
+        
+        logging.info("Requesting devices data...")
+        devices_data = request_data(devices_url, headers, data={
+            "page": PAGE,
+            "limit": LIMIT,
+            "keyword": {},
+            "orders": ORDERS,
+        })
+        logging.info("Devices data received.")
+    except requests.RequestException as e:
+        logging.error("Error requesting data: %s", e)
+        return
+
+    # Load IP info cache
+    ip_info_cache = load_ip_info()
+    devices = devices_data.get('data', [])
+
+    if not devices:
+        logging.info("No devices data found.")
+        return
+
+    stats, retailers = process_devices(devices, ip_info_cache)
 
     logging.info(f"Data successfully exported to {CSV_OUTPUT_FILE} and {XLSX_OUTPUT_FILE}")
     logging.info("Script completed.")
