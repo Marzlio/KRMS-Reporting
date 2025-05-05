@@ -17,8 +17,7 @@ This project filters device data from the KRMS API, enriches it with geolocation
 - `pandas` library
 - `python-dotenv` library
 - `openpyxl` library
-- `xlsxwriter` library
-- `smtplib` library (standard in Python)
+- `geoip2` library
 
 ## Installation
 
@@ -45,29 +44,35 @@ This project filters device data from the KRMS API, enriches it with geolocation
 4. Create a `.env` file in the project root with the following content:
 
     ```env
-    # KRMS login Details
-    API_USERNAME=your_api_username
-    PASSWORD=your_api_password
-    CLIENT_KEY=your_client_key
-    # KRMS API settings
-    PAGE=1
-    LIMIT=500000
-    ORDERS=[]
-    # IP Info API - https://ipinfo.io/
-    IPINFO_TOKEN=your_ipinfo_token
-    # Export file names
-    XLSX_OUTPUT_FILE=KRMS_Devices.xlsx
-    CSV_OUTPUT_FILE=KRMS_Devices.csv
-    # SMTP Settings
-    SMTP_SERVER=smtp.office365.com
-    SMTP_PORT=587
-    TTLS=TRUE
-    LOGIN_REQUIRED=TRUE
-    EMAIL_USERNAME=your_office365_email@example.com
-    EMAIL_PASSWORD=your_office365_password
-    EMAIL_TO=recipient1@example.com,recipient2@example.com
-    EMAIL_SUBJECT=KRMS Devices Report
-    SEND_EMAIL=true
+# KRMS API
+API_USERNAME=<your KRMS username>
+PASSWORD=<your KRMS password>
+CLIENT_KEY=<your KRMS client key>
+
+# Pagination (optional)
+PAGE=1
+LIMIT=10000000
+ORDERS=[]
+
+# Output file names (optional)
+CSV_OUTPUT_FILE=devices.csv
+XLSX_OUTPUT_FILE=devices.xlsx
+
+# GeoIP
+MAXMIND_LICENSE_KEY=<your MaxMind license-key>
+GEOIP_DB_PATH=GeoLite2-City.mmdb
+
+# Email (if you want the script to send mail)
+SMTP_SERVER=<smtp.example.com>
+SMTP_PORT=587
+TTLS=true              # start TLS?
+LOGIN_REQUIRED=true
+EMAIL_USERNAME=<smtp login>
+EMAIL_PASSWORD=<smtp password>
+EMAIL_TO="user@domain.com,other@domain.com"
+EMAIL_SUBJECT="KRMS Devices Report"
+SEND_EMAIL=true
+ATTACH_FILE=true
     ```
 
 ## Usage

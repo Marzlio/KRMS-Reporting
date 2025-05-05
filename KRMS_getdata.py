@@ -1,436 +1,400 @@
-import requests
-import csv
-import pandas as pd
-from datetime import datetime, timedelta
-from dotenv import load_dotenv
 import os
 import json
+import csv
+import tarfile
+import tempfile
+import shutil
 import logging
+import requests
+import pandas as pd
+import geoip2.database
+import ipaddress
 import smtplib
-from email.mime.multipart import MIMEMultipart
+
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
 from email import encoders
-from typing import Dict, Any
+from typing import Dict, Any, Tuple, List
 
-# Load environment variables from .env file
+# -----------------------------------------------------------------------------
+# Load environment variables
+# -----------------------------------------------------------------------------
 load_dotenv()
 
-# Constants
-API_USERNAME = os.getenv('API_USERNAME')
-PASSWORD = os.getenv('PASSWORD')
-CLIENT_KEY = os.getenv('CLIENT_KEY')
-PAGE = int(os.getenv('PAGE', 1))
-LIMIT = int(os.getenv('LIMIT', 10000000))
-ORDERS = json.loads(os.getenv('ORDERS', '["syncTime DESC"]'))
-CSV_OUTPUT_FILE = os.getenv('CSV_OUTPUT_FILE', 'devices.csv')
+# KRMS API credentials
+API_USERNAME    = os.getenv('API_USERNAME') or (_ for _ in ()).throw(ValueError("Missing API_USERNAME"))
+PASSWORD        = os.getenv('PASSWORD')     or (_ for _ in ()).throw(ValueError("Missing PASSWORD"))
+CLIENT_KEY      = os.getenv('CLIENT_KEY')   or (_ for _ in ()).throw(ValueError("Missing CLIENT_KEY"))
+
+# Pagination
+PAGE            = int(os.getenv('PAGE', '1'))
+LIMIT           = int(os.getenv('LIMIT', '10000000'))
+try:
+    ORDERS = json.loads(os.getenv('ORDERS', '["syncTime DESC"]'))
+except json.JSONDecodeError:
+    ORDERS = ["syncTime DESC"]
+
+# Output files
+CSV_OUTPUT_FILE  = os.getenv('CSV_OUTPUT_FILE', 'devices.csv')
 XLSX_OUTPUT_FILE = os.getenv('XLSX_OUTPUT_FILE', 'devices.xlsx')
-IPINFO_TOKEN = os.getenv('IPINFO_TOKEN')
-SMTP_SERVER = os.getenv('SMTP_SERVER')
-SMTP_PORT = int(os.getenv('SMTP_PORT', 587))
-TTLS = os.getenv('TTLS', 'TRUE').upper() == 'TRUE'
-LOGIN_REQUIRED = os.getenv('LOGIN_REQUIRED', 'TRUE').upper() == 'TRUE'
-EMAIL_USERNAME = os.getenv('EMAIL_USERNAME')
-EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD')
-EMAIL_TO = os.getenv('EMAIL_TO').split(',')
-EMAIL_SUBJECT = os.getenv('EMAIL_SUBJECT')
-SEND_EMAIL = os.getenv('SEND_EMAIL', 'TRUE').upper() == 'TRUE'
+REPORT_FILE      = 'krms_devices_report.html'
 
-# Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
-logger = logging.getLogger()
+# GeoIP config
+MAXMIND_LICENSE_KEY = os.getenv('MAXMIND_LICENSE_KEY') or (_ for _ in ()).throw(ValueError("Missing MAXMIND_LICENSE_KEY"))
+GEOIP_DB_PATH       = os.getenv('GEOIP_DB_PATH', 'GeoLite2-City.mmdb')
 
-# File for the final report
-REPORT_FILE = 'krms_devices_report.html'
+# Email settings
+SMTP_SERVER     = os.getenv('SMTP_SERVER', '')
+SMTP_PORT       = int(os.getenv('SMTP_PORT', '587'))
+TTLS            = os.getenv('TTLS', 'true').strip().lower() in ('true','1','yes')
+LOGIN_REQUIRED  = os.getenv('LOGIN_REQUIRED', 'true').strip().lower() in ('true','1','yes')
+EMAIL_USERNAME  = os.getenv('EMAIL_USERNAME','')
+EMAIL_PASSWORD  = os.getenv('EMAIL_PASSWORD','')
+EMAIL_TO        = os.getenv('EMAIL_TO','')
+EMAIL_SUBJECT   = os.getenv('EMAIL_SUBJECT','KRMS Devices Report')
+SEND_EMAIL      = os.getenv('SEND_EMAIL','true').strip().lower() in ('true','1','yes')
+ATTACH_FILE     = os.getenv('ATTACH_FILE','true').strip().lower() in ('true','1','yes')
 
-class IPFetchError(Exception):
-    """Custom exception for IP fetch failures."""
-    pass
+# -----------------------------------------------------------------------------
+# Logging setup
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
+# -----------------------------------------------------------------------------
+# Refresh GeoLite2 database on Tue/Fri or if missing
+# -----------------------------------------------------------------------------
+def refresh_geolite_db():
+    today = datetime.utcnow().date()
+    if os.path.exists(GEOIP_DB_PATH) and today.isoweekday() not in (2,5):
+        return
+    url = (
+        f"https://download.maxmind.com/app/geoip_download"
+        f"?edition_id=GeoLite2-City"
+        f"&license_key={MAXMIND_LICENSE_KEY}"
+        f"&suffix=tar.gz"
+    )
+    logger.info(f"Downloading GeoLite2 database...")
+    resp = requests.get(url, stream=True)
+    resp.raise_for_status()
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        for chunk in resp.iter_content(1024*1024):
+            tmp.write(chunk)
+    with tarfile.open(tmp.name, 'r:gz') as tar:
+        member = next(m for m in tar.getmembers() if m.name.endswith('.mmdb'))
+        with tar.extractfile(member) as mm, open(GEOIP_DB_PATH, 'wb') as out:
+            shutil.copyfileobj(mm, out)
+    os.unlink(tmp.name)
+    logger.info(f"GeoLite2 updated at {GEOIP_DB_PATH}")
+
+refresh_geolite_db()
+geo_reader = geoip2.database.Reader(GEOIP_DB_PATH)
+
+# -----------------------------------------------------------------------------
+# KRMS API functions
+# -----------------------------------------------------------------------------
 def request_token() -> str:
-    """Request an API token."""
-    token_url = "https://www.krms.openview.co.za/auth/v1/token"
-    headers = {
-        "Content-Type": "application/json;charset=utf-8",
-        "User-Agent": "Mozilla/5.0"
-    }
-    data = {
-        "user": API_USERNAME,
-        "password": PASSWORD,
-        "clientKey": CLIENT_KEY
-    }
+    resp = requests.post(
+        "https://www.krms.openview.co.za/auth/v1/token",
+        headers={"Content-Type": "application/json;charset=utf-8"},
+        json={"user": API_USERNAME, "password": PASSWORD, "clientKey": CLIENT_KEY}
+    )
+    resp.raise_for_status()
+    body = resp.json()
+    if body.get('code') != 'success':
+        raise RuntimeError("Token request failed")
+    logger.info("API token received.")
+    return body['token']
+
+# -----------------------------------------------------------------------------
+# Fetch all devices
+# -----------------------------------------------------------------------------
+def fetch_all_data(token: str) -> List[dict]:
+    headers = {"Authorization": f"Bearer {token}"}
+    # Warmup
+    for url in ("https://www.krms.openview.co.za/auth/v1/profile",
+                "https://www.krms.openview.co.za/api/v1/iams/user"):  
+        r = requests.get(url, headers=headers); r.raise_for_status()
+    devices_url = "https://www.krms.openview.co.za/api/v1/devices/connects/page"
+    all_devices = []
+    page = 1
+    while True:
+        payload = {"page": page, "limit": LIMIT, "keyword": {}, "orders": ORDERS}
+        r = requests.post(devices_url, headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json().get('data', [])
+        if not data: break
+        all_devices.extend(data)
+        logger.info(f"Fetched page {page} ({len(data)} records)")
+        page += 1
+    return all_devices
+
+# -----------------------------------------------------------------------------
+# Local GeoIP lookup
+# -----------------------------------------------------------------------------
+def lookup_geo(ip: str) -> Dict[str, Any]:
     try:
-        response = requests.post(token_url, headers=headers, json=data)
-        response.raise_for_status()
-        token_response = response.json()
-        if token_response.get("code") == "success":
-            logging.info("Token received successfully.")
-            return token_response.get("token")
-        else:
-            logging.error("Failed to get token. Response code: %s", token_response.get("code"))
-            raise Exception("Failed to get token.")
-    except requests.RequestException as e:
-        logging.error("Error requesting token: %s", e)
-        raise
+        rec = geo_reader.city(ip)
+        # Primary country code or fallback to registered country
+        country = rec.country.iso_code or rec.registered_country.iso_code or ''
+        return {
+            'country': country,
+            'province': rec.subdivisions.most_specific.iso_code or '',
+            'city': rec.city.name or '',
+            'latitude': rec.location.latitude or 0.0,
+            'longitude': rec.location.longitude or 0.0
+        }
+    except Exception:
+        return {
+            'country': '',
+            'province': '',
+            'city': '',
+            'latitude': 0.0,
+            'longitude': 0.0
+        }
 
-def request_data(url: str, headers: dict, data: dict = None) -> dict:
-    """Request data from the API."""
-    try:
-        response = requests.post(url, headers=headers, json=data) if data else requests.get(url, headers=headers)
-        response.raise_for_status()
-        return response.json()
-    except requests.RequestException as e:
-        logging.error("Error requesting data from %s: %s", url, e)
-        raise
-
-def load_ip_info(file_path: str = 'ip_info.json') -> Dict[str, Any]:
-    """Load IP info from a JSON file."""
-    try:
-        if os.path.exists(file_path):
-            with open(file_path, 'r') as file:
-                logging.info("Loaded IP info from %s", file_path)
-                return json.load(file)
-    except Exception as e:
-        logging.error("Error loading IP info: %s", e)
-    return {}
-
-def save_ip_info(ip_info: Dict[str, Any], file_path: str = 'ip_info.json') -> None:
-    """Save IP info to a JSON file."""
-    try:
-        with open(file_path, 'w') as file:
-            json.dump(ip_info, file)
-            logging.info("Saved IP info to %s", file_path)
-    except Exception as e:
-        logging.error("Error saving IP info: %s", e)
-
-def fetch_ip_info(ip_address: str, ip_info_cache: Dict[str, Any]) -> Dict[str, Any]:
-    """Fetch IP information, using cache if available."""
-    if ip_address in ip_info_cache:
-        return ip_info_cache[ip_address]
-
-    url = f"https://ipinfo.io/{ip_address}?token={IPINFO_TOKEN}"
-    try:
-        response = requests.get(url)
-        response.raise_for_status()
-        ip_info_cache[ip_address] = response.json()
-        save_ip_info(ip_info_cache)
-        return ip_info_cache[ip_address]
-    except requests.RequestException as e:
-        raise IPFetchError(f"Failed to fetch data for {ip_address}: {e}")
-
-def generate_report(stats: Dict[str, Any], retailers: Dict[str, Dict[str, int]]) -> str:
-    """Generate a report with the collected statistics and return the report as a string."""
-    report_content = f"""
-    <html>
-        <head>
-            <style>
-                body {{
-                    font-family: Arial, sans-serif;
-                    color: #333;
-                }}
-                h1 {{
-                    color: #004080;
-                }}
-                p {{
-                    margin: 0 0 10px;
-                }}
-                table {{
-                    width: 100%;
-                    border-collapse: collapse;
-                }}
-                th, td {{
-                    border: 1px solid #ddd;
-                    padding: 8px;
-                }}
-                th {{
-                    padding-top: 12px;
-                    padding-bottom: 12px;
-                    text-align: left;
-                    background-color: #004080;
-                    color: white;
-                }}
-                .section {{
-                    margin-bottom: 20px;
-                }}
-                .section-title {{
-                    font-weight: bold;
-                    text-decoration: underline;
-                }}
-            </style>
-        </head>
-        <body>
-            <h1>KRMS Devices Report</h1>
-            <div class="section">
-                <p class="section-title">Summary:</p>
-                <p>Total Number of devices on KRMS: {stats['total_devices']}</p>
-                <p>Total Number of CAS activated devices: {stats['cas_activated']}</p>
-                <p>Total Number of devices in South Africa: <span style="color: green; font-weight: bold;">{stats['devices_in_sa']}</span></p>
-                <p>Devices not in South Africa: <span style="color: red; font-weight: bold;">{stats['devices_not_in_sa']}</span></p>
-                <p>Number of devices currently online: {stats['devices_online']}</p>
-                <p>Number of devices connected in the last 24 hours: {stats['connected_last_24h']}</p>
-                <p>New devices connected in the last 24 hours: {stats['new_connected_last_24h']}</p>
-                <p>New devices connected in the last 7 days: {stats['new_connected_last_7_days']}</p>
-                <p>New devices connected since the first of the month: {stats['new_connected_since_first_of_month']}</p>
-            </div>
-            <div class="section">
-                <p class="section-title">Devices per retailer:</p>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Retailer</th>
-                            <th>Total Devices</th>
-                            <th>CAS Activated</th>
-                            <th>Cas Activated not in ZA</th>
-                            <th>Cas Activated in ZA</th>
-                            <th>Online in ZA</th>
-                            <th>Online Not In ZA</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-    """
-    for retailer, counts in retailers.items():
-        report_content += f"""
-                        <tr>
-                            <td>{retailer}</td>
-                            <td>{counts['total']}</td>
-                            <td>{counts['activated']}</td>
-                            <td>{counts['cas_not_in_sa']}</td>
-                            <td>{counts['cas_in_sa']}</td>
-                            <td>{counts['in_sa']}</td>
-                            <td>{counts['online_not_in_sa']}</td>
-
-                        </tr>
-        """
-    
-    report_content += """
-                    </tbody>
-                </table>
-            </div>
-        </body>
-    </html>
-    """
-    
-    with open(REPORT_FILE, 'w') as report:
-        report.write(report_content)
-
-    return report_content
-
-ATTACH_FILE = os.getenv('ATTACH_FILE', 'TRUE').upper() == 'TRUE'
-
-def send_email(report_content: str, attachment_path: str) -> None:
-    """Send an email with the report and attachment."""
-    msg = MIMEMultipart()
-    msg['From'] = EMAIL_USERNAME
-    msg['To'] = ', '.join(EMAIL_TO)
-    msg['Subject'] = EMAIL_SUBJECT
-
-    # Attach the body with the msg instance
-    msg.attach(MIMEText(report_content, 'html'))
-
-    if ATTACH_FILE:
-        # Open the file to be sent
-        with open(attachment_path, "rb") as attachment:
-            part = MIMEBase('application', 'octet-stream')
-            part.set_payload(attachment.read())
-
-        encoders.encode_base64(part)
-        part.add_header('Content-Disposition', f"attachment; filename= {os.path.basename(attachment_path)}")
-        msg.attach(part)
-
-    # Send the message via the SMTP server
-    try:
-        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
-        if TTLS:
-            server.starttls()
-        if LOGIN_REQUIRED:
-            server.login(EMAIL_USERNAME, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_USERNAME, EMAIL_TO, msg.as_string())
-        logging.info("Email sent successfully.")
-        server.quit()
-    except Exception as e:
-        logging.error(f"Failed to send email: {e}")
-
-def process_devices(devices: list, ip_info_cache: dict) -> tuple:
-    """Process devices and gather statistics."""
-    csv_headers = list(devices[0].keys()) if devices else []
-    if "country" not in csv_headers:
-        csv_headers.append("country")
-
-    stats = {
-        'total_devices': len(devices),
-        'cas_activated': 0,
-        'devices_in_sa': 0,
-        'devices_not_in_sa': 0,
-        'devices_online': 0,
-        'connected_last_24h': 0,
-        'new_connected_last_24h': 0,
-        'new_connected_last_7_days': 0,
-        'new_connected_since_first_of_month': 0
-    }
+# -----------------------------------------------------------------------------
+# Process devices & export
+# -----------------------------------------------------------------------------
+def process_devices(devices: List[dict]) -> Tuple[Dict[str, Any], Dict[str, Dict[str,int]]]:
+    # Stats init
+    stats = dict.fromkeys([
+        'total_devices','cas_activated','devices_in_sa','devices_not_in_sa',
+        'devices_online','connected_last_24h','new_connected_last_24h',
+        'new_connected_last_7_days','new_connected_since_first_of_month'
+    ], 0)
+    stats['total_devices'] = len(devices)   
     retailers = {}
+    now = datetime.utcnow()
+    first_mo = now.replace(day=1)
 
-    now = datetime.now()
-    first_of_month = now.replace(day=1)
-
-    with open(CSV_OUTPUT_FILE, 'w', newline='', encoding='utf-8') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=csv_headers)
+    # Prepare CSV with geo fields
+    headers = set().union(*(d.keys() for d in devices))
+    headers.update(['country','province','city','latitude','longitude'])
+    with open(CSV_OUTPUT_FILE, 'w', newline='', encoding='utf-8') as cf:
+        writer = csv.DictWriter(cf, fieldnames=list(headers))
         writer.writeheader()
+        for d in devices:
+            ip = d.get('locationIp','')
+            if ip:
+                geo = lookup_geo(ip)
+                d.update(geo)
+            # CAS
+            act = d.get('cpeServiceStatus')
+            is_cas = (isinstance(act,bool) and act) or (isinstance(act,str) and act.lower()=='activated')
+            if is_cas: stats['cas_activated'] += 1
+            # online
+            onv = d.get('online')
+            is_on = (isinstance(onv,bool) and onv) or (isinstance(onv,str) and onv.lower()=='true')
+            if is_on: stats['devices_online'] += 1
+            # country
+            if d.get('country') == 'ZA': stats['devices_in_sa'] += 1
+            # syncTime
+            st = d.get('syncTime')
+            if st and datetime.fromtimestamp(st) >= now - timedelta(days=1):
+                stats['connected_last_24h'] += 1
+            # connectedTime
+            ct = d.get('connectedTime')
+            if ct:
+                cdt = datetime.fromtimestamp(ct)
+                if cdt >= now - timedelta(days=1): stats['new_connected_last_24h'] += 1
+                if cdt >= now - timedelta(days=7): stats['new_connected_last_7_days'] += 1
+                if cdt >= first_mo: stats['new_connected_since_first_of_month'] += 1
+            # retailer  
+            
+            r = d.get('retailer') or 'No Retailer Added'
+            ret = retailers.setdefault(r, dict(total=0, activated=0,
+                                                  cas_in_sa=0, cas_not_in_za=0,
+                                                  in_sa=0, online_not_in_za=0))
+            ret['total'] += 1
+            if is_cas:
+                ret['activated'] += 1
+                if d.get('country') == 'ZA': ret['cas_in_sa'] += 1
+                else: ret['cas_not_in_za'] += 1
+            if d.get('country') == 'ZA': ret['in_sa'] += 1
+            if d.get('country') not in ('ZA','') and ct: ret['online_not_in_za'] += 1
+            writer.writerow(d)
 
-        for device in devices:
-            device_id = device.get('device_id')  # Use 'device_id'
+# -----------------------------------------------------------------------------
+# Process devices & export
+# -----------------------------------------------------------------------------
+def process_devices(devices: List[dict]) -> Tuple[Dict[str, Any], Dict[str, Dict[str,int]]]:
+    # Stats init
+    stats = dict.fromkeys([
+        'total_devices','cas_activated','devices_in_sa','devices_not_in_sa',
+        'devices_online','connected_last_24h','new_connected_last_24h',
+        'new_connected_last_7_days','new_connected_since_first_of_month'
+    ], 0)
+    stats['total_devices'] = len(devices)
+    retailers = {}
+    now = datetime.utcnow()
+    first_mo = now.replace(day=1)
 
-            if not device_id:
-                logging.warning(f"Skipping device with missing ID. Full data: {device}")
-                continue
+    # Prepare CSV with geo fields
+    headers = set().union(*(d.keys() for d in devices))
+    headers.update(['country','province','city','latitude','longitude'])
+    with open(CSV_OUTPUT_FILE, 'w', newline='', encoding='utf-8') as cf:
+        writer = csv.DictWriter(cf, fieldnames=list(headers))
+        writer.writeheader()
+        for d in devices:
+            ip = d.get('locationIp','')
+            if ip:
+                geo = lookup_geo(ip)
+                d.update(geo)
+            # CAS
+            act = d.get('cpeServiceStatus')
+            is_cas = (isinstance(act,bool) and act) or (isinstance(act,str) and act.lower()=='activated')
+            if is_cas: stats['cas_activated'] += 1
+            # online
+            onv = d.get('online')
+            is_on = (isinstance(onv,bool) and onv) or (isinstance(onv,str) and onv.lower()=='true')
+            if is_on: stats['devices_online'] += 1
+            # country
+            if d.get('country') == 'ZA': stats['devices_in_sa'] += 1
+            # syncTime
+            st = d.get('syncTime')
+            if st and datetime.fromtimestamp(st) >= now - timedelta(days=1):
+                stats['connected_last_24h'] += 1
+            # connectedTime
+            ct = d.get('connectedTime')
+            if ct:
+                cdt = datetime.fromtimestamp(ct)
+                if cdt >= now - timedelta(days=1): stats['new_connected_last_24h'] += 1
+                if cdt >= now - timedelta(days=7): stats['new_connected_last_7_days'] += 1
+                if cdt >= first_mo: stats['new_connected_since_first_of_month'] += 1
+            # retailer
+            r = d.get('retailer') or 'No Retailer Added'
+            ret = retailers.setdefault(r, dict(total=0, activated=0,
+                                               cas_in_sa=0, cas_not_in_za=0,
+                                               in_sa=0, online_not_in_za=0))
+            ret['total'] += 1
+            if is_cas:
+                ret['activated'] += 1
+                if d.get('country') == 'ZA': ret['cas_in_sa'] += 1
+                else: ret['cas_not_in_za'] += 1
+            if d.get('country') == 'ZA': ret['in_sa'] += 1
+            if d.get('country') not in ('ZA','') and ct: ret['online_not_in_za'] += 1
+            writer.writerow(d)
 
-            ip_address = device.get('locationIp')
-            if ip_address:
-                try:
-                    ip_info = fetch_ip_info(ip_address, ip_info_cache)  # Handle IPFetchError
-                except IPFetchError as e:
-                    logging.error(str(e))
-                    continue  # Skip to the next device if IP fetch fails
-
-                if 'error' not in ip_info:
-                    ip_province = ip_info.get('region')
-                    ip_city = ip_info.get('city')
-                    ip_latitude, ip_longitude = map(float, ip_info.get('loc', '0,0').split(','))
-                    ip_country = ip_info.get('country')
-
-                    # Compare and update logic
-                    if (device.get('province') != ip_province or 
-                        device.get('city') != ip_city or 
-                        device.get('latitude') != ip_latitude or 
-                        device.get('longitude') != ip_longitude or
-                        device.get('country') != ip_country):
-                        
-                        device['province'] = ip_province
-                        device['city'] = ip_city
-                        device['latitude'] = ip_latitude
-                        device['longitude'] = ip_longitude
-                        device['country'] = ip_country
-
-            # Update statistics
-            activation_status = device.get('cpeServiceStatus')
-            if (isinstance(activation_status, bool) and activation_status) or (isinstance(activation_status, str) and activation_status.lower() == 'activated'):
-                stats['cas_activated'] += 1
-
-            if device.get('country') == 'ZA':
-                stats['devices_in_sa'] += 1
-
-            if (isinstance(device.get('online'), bool) and device['online']) or (isinstance(device.get('online'), str) and device['online'].lower() == 'true'):
-                stats['devices_online'] += 1
-
-            # Check connection times
-            sync_time = device.get('syncTime')
-            connected_time = device.get('connectedTime')
-
-            if sync_time:
-                sync_time = datetime.fromtimestamp(sync_time)
-                if sync_time >= now - timedelta(days=1):
-                    stats['connected_last_24h'] += 1
-
-            if connected_time:
-                connected_time = datetime.fromtimestamp(connected_time)
-                if connected_time >= now - timedelta(days=1):
-                    stats['new_connected_last_24h'] += 1
-                if connected_time >= now - timedelta(days=7):
-                    stats['new_connected_last_7_days'] += 1
-                if connected_time >= first_of_month:
-                    stats['new_connected_since_first_of_month'] += 1
-
-            retailer = device.get('retailer', 'No Retailer Added')
-            if retailer in retailers:
-                retailers[retailer]['total'] += 1
-                if (isinstance(activation_status, bool) and activation_status) or (isinstance(activation_status, str) and activation_status.lower() == 'activated'):
-                    retailers[retailer]['activated'] += 1
-                if device.get('country') == 'ZA':
-                    retailers[retailer]['in_sa'] += 1
-                if (isinstance(activation_status, bool) and activation_status) or (isinstance(activation_status, str) and activation_status.lower() == 'activated') and device.get('country') != 'ZA':
-                    retailers[retailer]['cas_not_in_sa'] += 1
-                if (isinstance(activation_status, bool) and activation_status) or (isinstance(activation_status, str) and activation_status.lower() == 'activated') and device.get('country') == 'ZA':
-                    retailers[retailer]['cas_in_sa'] += 1
-                if (device.get('country') != 'ZA' and device.get('country') != '') and (device.get('connectedTime') != 0):
-                        retailers[retailer]['online_not_in_sa'] += 1
-
-            else:
-                retailers[retailer] = {
-                    'total': 1,
-                    'activated': 1 if (isinstance(activation_status, bool) and activation_status) or (isinstance(activation_status, str) and activation_status.lower() == 'activated') else 0,
-                    'in_sa': 1 if device.get('country') == 'ZA' else 0,
-                    'cas_not_in_sa': 1 if (isinstance(activation_status, bool) and activation_status) or (isinstance(activation_status, str) and activation_status.lower() == 'activated') and device.get('country') != 'ZA' else 0,
-                    'cas_in_sa': 1 if (isinstance(activation_status, bool) and activation_status) or (isinstance(activation_status, str) and activation_status.lower() == 'activated') and device.get('country') == 'ZA' else 0,
-                    'online_not_in_sa': 1 if (isinstance(device.get('online'), bool) and device['online']) or (isinstance(device.get('online'), str) and device['online'].lower() == 'true') and device.get('country') != 'ZA' and device.get('country') != '' else 0
-                }
-
-            writer.writerow(device)
-
-    # Save data to XLSX
-    df = pd.DataFrame(devices)
-    df.to_excel(XLSX_OUTPUT_FILE, index=False)
-
+    # XLSX export
+    pd.DataFrame(devices).to_excel(XLSX_OUTPUT_FILE, index=False)
     stats['devices_not_in_sa'] = stats['cas_activated'] - stats['devices_in_sa']
-
     return stats, retailers
 
-def main() -> None:
-    """Main function to execute the script."""
-    logging.info("Script started.")
-    try:
-        token = request_token()
-    except Exception as e:
-        logging.error("Failed to obtain token: %s", e)
+# -----------------------------------------------------------------------------
+# Generate HTML report
+# -----------------------------------------------------------------------------
+def generate_report(stats: Dict[str,int], retailers: Dict[str,Dict[str,int]]) -> str:
+    html = f"""
+    <html><head>
+      <style>
+        body {{ font-family: Arial; margin: 20px; }}
+        h1 {{ color: #004080; }}
+        h2 {{ margin-top: 30px; color: #004080; }}
+        .summary {{ margin-bottom: 20px; }}
+        .summary p {{ margin: 4px 0; font-size: 14px; }}
+        .summary .positive {{ color: green; font-weight: bold; }}
+        .summary .negative {{ color: red;   font-weight: bold; }}
+        table {{ width: 100%; border-collapse: collapse; }}
+        th, td {{ border: 1px solid #ddd; padding: 8px; font-size: 13px; }}
+        th {{ background: #004080; color: #fff; text-align: left; }}
+        tbody tr:nth-child(odd) {{ background: #f9f9f9; }}
+      </style>
+    </head><body>
+      <h1>KRMS Devices Report</h1>
+
+      <div class="summary">
+        <h2>Summary:</h2>
+        <p>Total Number of devices on KRMS: {stats['total_devices']}</p>
+        <p>Total Number of CAS activated devices: {stats['cas_activated']}</p>
+        <p class="positive">Total Number of devices in South Africa: {stats['devices_in_sa']}</p>
+        <p class="negative">Devices not in South Africa: {stats['devices_not_in_sa']}</p>
+        <p>Number of devices currently online: {stats['devices_online']}</p>
+        <p>Number of devices connected in the last 24 hours: {stats['connected_last_24h']}</p>
+        <p>New devices connected in the last 24 hours: {stats['new_connected_last_24h']}</p>
+        <p>New devices connected in the last 7 days: {stats['new_connected_last_7_days']}</p>
+        <p>New devices connected since the first of the month: {stats['new_connected_since_first_of_month']}</p>
+      </div>
+
+      <h2>Devices per retailer:</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Retailer</th>
+            <th>Total Devices</th>
+            <th>CAS Activated</th>
+            <th>CAS Activated not in ZA</th>
+            <th>CAS Activated in ZA</th>
+            <th>Online in ZA</th>
+            <th>Online Not in ZA</th>
+          </tr>
+        </thead>
+        <tbody>
+    """
+    for retailer, vals in retailers.items():
+        html += (
+          f"<tr>"
+          f"<td>{retailer}</td>"
+          f"<td>{vals['total']}</td>"
+          f"<td>{vals['activated']}</td>"
+          f"<td>{vals['cas_not_in_za']}</td>"
+          f"<td>{vals['cas_in_sa']}</td>"
+          f"<td>{vals['in_sa']}</td>"
+          f"<td>{vals['online_not_in_za']}</td>"
+          f"</tr>"
+        )
+    html += """
+        </tbody>
+      </table>
+    </body></html>
+    """
+    with open(REPORT_FILE, 'w', encoding='utf-8') as f:
+        f.write(html)
+    return html
+
+# -----------------------------------------------------------------------------
+# Send email
+# -----------------------------------------------------------------------------
+def send_email(report: str, attachment: str) -> None:
+    if not (EMAIL_USERNAME and EMAIL_PASSWORD and SMTP_SERVER and EMAIL_TO):
+        logger.error("Email not configured; skipping send.")
         return
+    msg = MIMEMultipart()
+    msg['From'] = EMAIL_USERNAME
+    msg['To'] = EMAIL_TO
+    msg['Subject'] = EMAIL_SUBJECT
+    msg.attach(MIMEText(report, 'html'))
+    if ATTACH_FILE and os.path.exists(attachment):
+        part = MIMEBase('application', 'octet-stream')
+        part.set_payload(open(attachment, 'rb').read())
+        encoders.encode_base64(part)
+        part.add_header('Content-Disposition', f'attachment; filename={os.path.basename(attachment)}')
+        msg.attach(part)
+    with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        if TTLS: server.starttls()
+        if LOGIN_REQUIRED: server.login(EMAIL_USERNAME, EMAIL_PASSWORD)
+        server.sendmail(EMAIL_USERNAME, EMAIL_TO.split(','), msg.as_string())
+    logger.info("Email sent.")
 
-    profile_url = "https://www.krms.openview.co.za/auth/v1/profile"
-    user_url = "https://www.krms.openview.co.za/api/v1/iams/user"
-    devices_url = "https://www.krms.openview.co.za/api/v1/devices/connects/page"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json;charset=utf-8",
-        "User-Agent": "Mozilla/5.0"
-    }
-
-    try:
-        logging.info("Requesting profile data...")
-        profile_data = request_data(profile_url, headers)
-        logging.info("Profile data received.")
-        
-        logging.info("Requesting user data...")
-        user_data = request_data(user_url, headers)
-        logging.info("User data received.")
-        
-        logging.info("Requesting devices data...")
-        devices_data = request_data(devices_url, headers, data={
-            "page": PAGE,
-            "limit": LIMIT,
-            "keyword": {},
-            "orders": ORDERS,
-        })
-        logging.info("Devices data received.")
-    except requests.RequestException as e:
-        logging.error("Error requesting data: %s", e)
-        return
-
-    # Load IP info cache
-    ip_info_cache = load_ip_info()
-    devices = devices_data.get('data', [])
-
+# -----------------------------------------------------------------------------
+# Main execution
+# -----------------------------------------------------------------------------
+if __name__ == '__main__':
+    logger.info("Script starting.")
+    token = request_token()
+    devices = fetch_all_data(token)
     if not devices:
-        logging.info("No devices data found.")
-        return
-
-    stats, retailers = process_devices(devices, ip_info_cache)
-
-    logging.info(f"Data successfully exported to {CSV_OUTPUT_FILE} and {XLSX_OUTPUT_FILE}")
-    logging.info("Script completed.")
-
-    # Generate and log report
-    report_content = generate_report(stats, retailers)
-
-    # Send email if required
+        logger.info("No devices found.")
+        exit(0)
+    stats, retailers = process_devices(devices)
+    report_html = generate_report(stats, retailers)
     if SEND_EMAIL:
-        send_email(report_content, XLSX_OUTPUT_FILE)
-
-if __name__ == "__main__":
-    main()
+        send_email(report_html, XLSX_OUTPUT_FILE)
+    logger.info("Script completed.")
