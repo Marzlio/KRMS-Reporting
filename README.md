@@ -7,17 +7,14 @@ This project filters device data from the KRMS API, enriches it with geolocation
 - Fetches device data from the KRMS API.
 - Enriches device data with geolocation information using IP addresses.
 - Generates a summary report of filtered devices.
-- Saves the filtered data to CSV and Excel files.
+- Saves the filtered data to CSV and Excel files (with timestamp in filenames).
 - Sends an email with the summary report and Excel file attachment.
+- Keeps only the N most recent output runs (default 10) to avoid filling the disk.
 
 ## Requirements
 
 - Python 3.7+
-- `requests` library
-- `pandas` library
-- `python-dotenv` library
-- `openpyxl` library
-- `geoip2` library
+- `requests`, `pandas`, `python-dotenv`, `openpyxl`, `xlsxwriter`, `geoip2`
 
 ## Installation
 
@@ -25,14 +22,14 @@ This project filters device data from the KRMS API, enriches it with geolocation
 
     ```sh
     git clone https://github.com/Marzlio/KRMS-Reporting.git
-    cd KRMS
+    cd KRMS-Reporting
     ```
 
 2. Create a virtual environment and activate it:
 
     ```sh
     python -m venv venv
-    source venv/bin/activate # On Windows use `venv\Scripts\activate`
+    source venv/bin/activate   # On Windows: venv\Scripts\activate
     ```
 
 3. Install the required packages:
@@ -41,56 +38,27 @@ This project filters device data from the KRMS API, enriches it with geolocation
     pip install -r requirements.txt
     ```
 
-4. Create a `.env` file in the project root with the following content:
-
-    ```env
-# KRMS API
-API_USERNAME=<your KRMS username>
-PASSWORD=<your KRMS password>
-CLIENT_KEY=<your KRMS client key>
-
-# Pagination (optional)
-PAGE=1
-LIMIT=10000000
-ORDERS=[]
-
-# Output file names (optional)
-CSV_OUTPUT_FILE=devices.csv
-XLSX_OUTPUT_FILE=devices.xlsx
-
-# GeoIP
-MAXMIND_LICENSE_KEY=<your MaxMind license-key>
-GEOIP_DB_PATH=GeoLite2-City.mmdb
-
-# Email (if you want the script to send mail)
-SMTP_SERVER=<smtp.example.com>
-SMTP_PORT=587
-TTLS=true              # start TLS?
-LOGIN_REQUIRED=true
-EMAIL_USERNAME=<smtp login>
-EMAIL_PASSWORD=<smtp password>
-EMAIL_TO="user@domain.com,other@domain.com"
-EMAIL_SUBJECT="KRMS Devices Report"
-SEND_EMAIL=true
-ATTACH_FILE=true
-    ```
+4. Copy `.env.sample` to `.env` and fill in your credentials (API_USERNAME, PASSWORD, CLIENT_KEY, MAXMIND_LICENSE_KEY, and optional email/output settings).
 
 ## Usage
 
-1. Run the script:
+```sh
+python KRMS_getdata.py
+```
 
-    ```sh
-    python KRMS_getdata.py
-    ```
+This will fetch the device data, enrich with geolocation, write timestamped CSV/XLSX/HTML (e.g. `KRMS_Devices_2026-02-19_053315.xlsx`), clean up outputs older than the 10 most recent runs, and send the report email if `SEND_EMAIL` is true.
 
-    This will fetch the device data, enrich the data with geolocation information, save the filtered data to CSV and Excel files, and send an email with the report if `SEND_EMAIL` is set to `true`.
+## Optional environment variables
 
-## File Structure
+- **GEOIP_REFRESH_DAYS** – Comma-separated weekdays (1=Mon … 7=Sun) when to refresh the GeoIP DB; default `2,5` (Tue, Fri).
+- **KEEP_LAST_N_RUNS** – Number of most recent timestamped runs to keep; default `10`. Older CSV/XLSX/HTML files are deleted after each run.
 
-- `KRMS_getdata.py`: Main script to fetch, filter, enrich data, and send email.
-- `.env`: Environment variables for configuration (not included in the repo).
-- `requirements.txt`: List of required Python packages.
-- `README.md`: This file.
+## File structure
+
+- `KRMS_getdata.py` – Main script (fetch, filter, enrich, report, email, cleanup).
+- `.env` – Environment variables (not in repo); use `.env.sample` as template.
+- `requirements.txt` – Python dependencies.
+- `README.md` – This file.
 
 ## License
 

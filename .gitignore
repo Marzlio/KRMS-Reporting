@@ -124,6 +124,14 @@ celerybeat.pid
 # Environments
 .env
 .venv
+
+# KRMS report outputs (timestamped) and cron log
+KRMS_Devices_*.csv
+KRMS_Devices_*.xlsx
+krms_devices_report_*.html
+devices_*.csv
+devices_*.xlsx
+cronjob.log
 env/
 venv/
 ENV/
